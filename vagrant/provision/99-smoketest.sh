@@ -43,6 +43,12 @@ VM_IP=$(ip -4 -o addr show scope global | awk -v nat="$NAT_IF" '$2 != nat {split
 VM_IP=${VM_IP:-$(ip -4 -o addr show scope global | awk '{split($4,a,"/"); print a[1]; exit}')}
 
 if [ "$TLS_MODE" = mkcert ]; then
-  echo "Trust the CA on your host: ./certs/rootCA.pem"
-  echo "Add this to your hosts file:  $VM_IP  $DOMAIN"
+  echo
+  echo "Hosts entry (on the computer where your BROWSER runs):"
+  if [ "$PUBLIC_HTTPS_PORT" = "443" ]; then
+    echo "  $VM_IP  $DOMAIN"
+  else
+    echo "  127.0.0.1  $DOMAIN   (and open a tunnel to port $PUBLIC_HTTPS_PORT)"
+  fi
+  echo "Trust the CA in ./certs/rootCA.pem (see README)"
 fi

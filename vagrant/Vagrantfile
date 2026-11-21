@@ -1,5 +1,6 @@
 # -*- mode: ruby -*-
 
+#Če zagnjate na MAC Pustite na 443,če pa na Linuxu potem pa 8443!!!
 HTTPS_PORT = ENV.fetch("HTTPS_PORT", "443")
 PROVISION_ENV = {
   "DOMAIN"            => ENV.fetch("DOMAIN", "myapp.local"),
@@ -14,7 +15,10 @@ Vagrant.configure("2") do |config|
   config.vm.hostname = "rails-app"
 
   config.vm.network "private_network", type: "dhcp"
-
+  if HTTPS_PORT != "443"
+      config.vm.network "forwarded_port", guest: 443, host: HTTPS_PORT.to_i,
+      host_ip: "127.0.0.1", auto_correct: false
+  end
   %w[00-base 10-postgres 20-redis 30-ruby-app 40-nginx-tls 50-monitoring 99-smoketest].each do |s|
     config.vm.provision s, type: "shell", path: "provision/#{s}.sh", env: PROVISION_ENV
   end
@@ -25,4 +29,17 @@ Vagrant.configure("2") do |config|
     v.cpus = 2
     v.linked_clone = true
   end
-end
+  config.vm.provider "virtualbox" do |vb|
+    vb.gui = false
+    vb.memory = 4096
+    vb.cpus = 2
+    vb.linked_clone = true
+  end
+  
+end                                                                                        
+
+
+
+
+
+
