@@ -1,0 +1,501 @@
+#cloud-config
+# sk-44 / cloud-init version: Rails app (Puma) + PostgreSQL + Redis + nginx
+hostname: cloud-app
+fqdn: __FQDN__
+timezone: Europe/Ljubljana
+
+# --- users: default "ubuntu" (SSH key only) + system user that runs the app
+ssh_pwauth: false
+users:
+  - default
+  - name: twitter
+    system: true
+    shell: /usr/sbin/nologin
+    homedir: /opt/twitter
+ssh_authorized_keys:
+  - __SSH_PUBKEY__
+
+# --- apt: Slovenian mirror (closer = faster downloads than archive.ubuntu.com)
+apt:
+  primary:
+    - arches: [default]
+      uri: http://si.archive.ubuntu.com/ubuntu/
+
+# --- packages: everything from apt (Ubuntu 24.04 repos)
+package_update: true
+package_upgrade: false
+packages:
+  - nginx
+  - certbot             # Let's Encrypt client (HTTP-01 via the webroot below)
+  - postgresql
+  - redis-server
+  - ruby-full            # Ruby 3.2 + ruby-dev headers
+  - ruby-bundler
+  - build-essential      # compilers for native gems (sassc, pg, bcrypt, ...)
+  - libpq-dev            # pg gem
+  - libyaml-dev          # psych gem
+  - libvips42t64         # image_processing (Active Storage variants); 24.04 name after the 64-bit time_t transition
+  - nodejs              # JS runtime for ExecJS (autoprefixer in the bootstrap gem, assets:precompile)
+  - git
+  - ufw
+  - fail2ban
+  - unattended-upgrades
+  # monitoring (Ubuntu repos); Grafana, Loki and Alloy come from the Grafana apt repo in setup-app.sh
+  - prometheus
+  - prometheus-node-exporter
+  - prometheus-postgres-exporter
+  - prometheus-redis-exporter
+  - prometheus-nginx-exporter
+  - jq                  # used by the smoke test
+
+# --- files. "defer: true" = written in the final stage, AFTER packages are
+#     installed (otherwise nginx/postgres directories would not exist yet)
+write_files:
+  - path: /etc/systemd/system/twitter.service
+    permissions: "0644"
+    defer: true
+    content: |
+      [Unit]
+      Description=Twitter clone (Rails / Puma)
+      After=network.target postgresql.service redis-server.service
+      Requires=postgresql.service redis-server.service
+
+      [Service]
+      Type=simple
+      User=twitter
+      Group=twitter
+      WorkingDirectory=/opt/twitter/app
+      EnvironmentFile=/etc/twitter/env
+      ExecStart=/usr/bin/bundle exec puma -C config/puma.rb -b tcp://127.0.0.1:3000
+      Restart=always
+      RestartSec=3
+      # hardening
+      NoNewPrivileges=true
+      PrivateTmp=true
+      ProtectSystem=full
+      ProtectHome=true
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/nginx/sites-available/twitter
+    permissions: "0644"
+    defer: true
+    content: |
+      upstream puma { server 127.0.0.1:3000; }
+      # websockets (Rails ActionCable, Grafana live) need the Upgrade headers passed on
+      map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+      # rate limits per real client IP (app: 10 req/s, password-protected pages: 10 req/min)
+      limit_req_zone $binary_remote_addr zone=app:10m rate=10r/s;
+      limit_req_zone $binary_remote_addr zone=auth:10m rate=10r/m;
+
+      # port 80: only the Let's Encrypt challenge, everything else -> HTTPS
+      server {
+        listen 80 default_server;
+        # the host router sends the real client IP in X-Forwarded-For
+        set_real_ip_from 192.168.56.1;
+        real_ip_header X-Forwarded-For;
+        server_name __FQDN__;
+        location /.well-known/acme-challenge/ { root /var/www/letsencrypt; }
+        location / { return 301 https://$host$request_uri; }
+      }
+
+      server {
+        listen 443 ssl http2 default_server;
+        # from the host router: PROXY protocol carries the real client IP (only reachable from 192.168.56.0/24)
+        listen 8443 ssl http2 proxy_protocol;
+        set_real_ip_from 192.168.56.1;
+        real_ip_header proxy_protocol;
+        limit_req_status 429;
+        server_name __FQDN__;
+        # symlinks: self-signed at first, switched to Let's Encrypt by setup-app.sh
+        ssl_certificate     /etc/nginx/ssl/fullchain.pem;
+        ssl_certificate_key /etc/nginx/ssl/privkey.pem;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_session_cache shared:SSL:10m;
+        ssl_session_tickets off;
+        server_tokens off;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header X-Frame-Options SAMEORIGIN always;
+        add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+        root /opt/twitter/app/public;
+        client_max_body_size 10m;
+
+        # precompiled assets served by nginx directly, cached long
+        location /assets/ {
+          expires 1y;
+          add_header Cache-Control "public, immutable";
+          try_files $uri =404;
+        }
+        location / {
+          try_files $uri @app;
+        }
+        location @app {
+          proxy_pass http://puma;
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection $connection_upgrade;
+          limit_req zone=app burst=20 nodelay;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto https;
+        }
+
+        # Grafana (own login) and Prometheus (HTTP basic auth), both only via HTTPS
+        location /grafana/ {
+          proxy_pass http://127.0.0.1:3001;
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection $connection_upgrade;
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto https;
+        }
+        location /prometheus/ {
+          auth_basic "Prometheus";
+          auth_basic_user_file /etc/nginx/.htpasswd;
+          limit_req zone=auth burst=5 nodelay;
+          proxy_pass http://127.0.0.1:9090;
+          proxy_set_header Host $host;
+        }
+      }
+
+      # internal only: request counters for the nginx exporter
+      server {
+        listen 127.0.0.1:8081;
+        location = /stub_status { stub_status; allow 127.0.0.1; deny all; }
+      }
+
+  # --- monitoring configs (same setup as the Vagrant version) ---
+  - path: /etc/prometheus/prometheus.yml
+    permissions: "0644"
+    defer: true
+    content: |
+      global:
+        scrape_interval: 15s
+        evaluation_interval: 15s
+      scrape_configs:
+        - job_name: prometheus
+          metrics_path: /prometheus/metrics
+          static_configs: [{ targets: ['127.0.0.1:9090'] }]
+        - job_name: node
+          static_configs: [{ targets: ['127.0.0.1:9100'] }]
+        - job_name: postgres
+          static_configs: [{ targets: ['127.0.0.1:9187'] }]
+        - job_name: redis
+          static_configs: [{ targets: ['127.0.0.1:9121'] }]
+        - job_name: nginx
+          static_configs: [{ targets: ['127.0.0.1:9113'] }]
+        - job_name: grafana
+          metrics_path: /grafana/metrics
+          static_configs: [{ targets: ['127.0.0.1:3001'] }]
+        - job_name: loki
+          static_configs: [{ targets: ['127.0.0.1:3100'] }]
+
+  # every exporter listens on localhost only; nothing is reachable from outside
+  - path: /etc/default/prometheus
+    defer: true
+    content: |
+      ARGS="--web.listen-address=127.0.0.1:9090 --web.external-url=/prometheus/ --web.route-prefix=/prometheus/ --storage.tsdb.retention.time=7d"
+  - path: /etc/default/prometheus-node-exporter
+    defer: true
+    content: |
+      ARGS="--web.listen-address=127.0.0.1:9100"
+  - path: /etc/default/prometheus-postgres-exporter
+    defer: true
+    content: |
+      DATA_SOURCE_NAME='user=prometheus host=/run/postgresql dbname=postgres'
+      ARGS="--web.listen-address=127.0.0.1:9187"
+  - path: /etc/default/prometheus-redis-exporter
+    defer: true
+    content: |
+      ARGS="--redis.addr=redis://127.0.0.1:6379 --web.listen-address=127.0.0.1:9121"
+  - path: /etc/default/prometheus-nginx-exporter
+    defer: true
+    content: |
+      ARGS="--nginx.scrape-uri=http://127.0.0.1:8081/stub_status --web.listen-address=127.0.0.1:9113"
+
+  # Loki / Alloy / Grafana packages are installed later, so their configs are staged here and copied after install
+  - path: /etc/sk44/loki.yml
+    defer: true
+    content: |
+      auth_enabled: false
+      server:
+        http_listen_address: 127.0.0.1
+        http_listen_port: 3100
+        grpc_listen_address: 127.0.0.1
+        grpc_listen_port: 9096
+      common:
+        instance_addr: 127.0.0.1
+        path_prefix: /var/lib/loki
+        storage:
+          filesystem:
+            chunks_directory: /var/lib/loki/chunks
+            rules_directory: /var/lib/loki/rules
+        replication_factor: 1
+        ring:
+          kvstore:
+            store: inmemory
+      schema_config:
+        configs:
+          - from: 2024-01-01
+            store: tsdb
+            object_store: filesystem
+            schema: v13
+            index:
+              prefix: index_
+              period: 24h
+      analytics:
+        reporting_enabled: false
+  - path: /etc/sk44/config.alloy
+    defer: true
+    content: |
+      // systemd journal (Rails/Puma, PostgreSQL, Redis, ...) + nginx logs -> Loki
+      loki.relabel "journal" {
+        forward_to = []
+        rule {
+          source_labels = ["__journal__systemd_unit"]
+          target_label  = "unit"
+        }
+      }
+      loki.source.journal "journal" {
+        forward_to    = [loki.write.local.receiver]
+        relabel_rules = loki.relabel.journal.rules
+        labels        = { job = "systemd-journal" }
+      }
+      local.file_match "nginx" {
+        path_targets = [{ "__path__" = "/var/log/nginx/*.log", "job" = "nginx" }]
+      }
+      loki.source.file "nginx" {
+        targets    = local.file_match.nginx.targets
+        forward_to = [loki.write.local.receiver]
+      }
+      loki.write "local" {
+        endpoint {
+          url = "http://127.0.0.1:3100/loki/api/v1/push"
+        }
+      }
+  - path: /etc/sk44/grafana-datasources.yml
+    defer: true
+    content: |
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          uid: prometheus
+          type: prometheus
+          access: proxy
+          url: http://127.0.0.1:9090/prometheus
+          isDefault: true
+        - name: Loki
+          uid: loki
+          type: loki
+          access: proxy
+          url: http://127.0.0.1:3100
+  - path: /etc/sk44/grafana-dashboards.yml
+    defer: true
+    content: |
+      apiVersion: 1
+      providers:
+        - name: default
+          folder: ''
+          type: file
+          options:
+            path: /var/lib/grafana/dashboards
+
+  # (no fail2ban jail for nginx: all web traffic reaches the VM from the router IP, so an iptables ban
+  #  would block everyone. Brute force on /prometheus/ is limited with nginx limit_req instead.
+  #  fail2ban still protects SSH, which is on by default.)
+
+  # logs survive reboots, capped at 500 MB
+  - path: /etc/systemd/journald.conf.d/persistent.conf
+    defer: true
+    content: |
+      [Journal]
+      Storage=persistent
+      SystemMaxUse=500M
+
+  - path: /usr/local/sbin/setup-app.sh
+    permissions: "0750"
+    defer: true
+    content: |
+      #!/usr/bin/env bash
+      # Installs and starts the app. Runs once from runcmd; log: /var/log/setup-app.log
+      set -euxo pipefail
+      step() { { set +x; } 2>/dev/null; echo "=== $(date +%T) $*"; set -x; }
+      APP=/opt/twitter/app
+      REPO=https://github.com/aneltoric123/Twitter.git
+      COMMIT=__APP_COMMIT__
+
+      # 1) secrets: generated INSIDE the VM, never stored in git or user-data
+      step "1) secrets: generated INSIDE the VM, never stored in git or user-data"
+      install -d -m 0750 -o root -g twitter /etc/twitter
+      DBPASS=$(openssl rand -hex 24)
+      cat > /etc/twitter/env <<EOF
+      RAILS_ENV=production
+      RAILS_LOG_TO_STDOUT=1
+      SECRET_KEY_BASE=$(openssl rand -hex 64)
+      TWITTER_COPY4_DATABASE_PASSWORD=$DBPASS
+      DATABASE_URL=postgres://twitter_copy4:$DBPASS@127.0.0.1/twitter_copy4_production
+      REDIS_URL=redis://127.0.0.1:6379/1
+      GOOGLE_CLIENT_ID=__GOOGLE_CLIENT_ID__
+      GOOGLE_CLIENT_SECRET=__GOOGLE_CLIENT_SECRET__
+      EOF
+      chmod 0640 /etc/twitter/env; chown root:twitter /etc/twitter/env
+      # monitoring login (Grafana admin + Prometheus basic auth), readable by root only
+      { set +x; } 2>/dev/null
+      MONPASS=$(openssl rand -hex 12)
+      printf 'Grafana:    https://__FQDN__/grafana/     admin / %s\nPrometheus: https://__FQDN__/prometheus/  admin / %s\n' "$MONPASS" "$MONPASS" > /root/monitoring.txt
+      chmod 0600 /root/monitoring.txt
+      printf 'admin:%s\n' "$(openssl passwd -apr1 "$MONPASS")" > /etc/nginx/.htpasswd
+      chown root:www-data /etc/nginx/.htpasswd; chmod 0640 /etc/nginx/.htpasswd
+      set -x
+
+      # 2) PostgreSQL: dedicated role + database (password auth over TCP)
+      step "2) PostgreSQL: dedicated role + database (password auth over TCP)"
+      sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE ROLE twitter_copy4 LOGIN PASSWORD '$DBPASS';"
+      sudo -u postgres createdb -O twitter_copy4 twitter_copy4_production
+
+      # 3) Redis: localhost only (default on Ubuntu), no persistence needed for ActionCable
+      step "3) Redis: localhost only (default on Ubuntu), no persistence needed for ActionCable"
+      systemctl enable --now redis-server
+
+      # 4) app code, pinned to a commit
+      step "4) app code, pinned to a commit"
+      install -d -o twitter -g twitter /opt/twitter
+      sudo -u twitter git clone "$REPO" "$APP"
+      sudo -u twitter git -C "$APP" checkout -q "$COMMIT"
+      # app was written for Ruby 3.0.2; Ubuntu 24.04 ships Ruby 3.2 (apt)
+      sed -i 's/^ruby "3.0.2"/ruby ">= 3.0"/' "$APP/Gemfile"
+      echo "ruby-$(ruby -e 'print RUBY_VERSION')" > "$APP/.ruby-version"
+      # lockfile pins Bundler 2.3.5 / Ruby 3.0.2 -> drop those two sections so the apt Bundler is used
+      sed -i -e '/^RUBY VERSION/,/^$/d' -e '/^BUNDLED WITH/,$d' "$APP/Gemfile.lock"
+
+      # 5) gems (production only) + assets + database
+      step "5) gems (production only) + assets + database"
+      cd "$APP"
+      sudo -u twitter bundle config set --local path vendor/bundle
+      sudo -u twitter bundle config set --local without 'development test'
+      # MAKE -j: native extensions (sassc!) compile on all CPU cores, not just one
+      sudo -u twitter env MAKE="make -j$(nproc)" bundle install --jobs "$(nproc)" --retry 3
+      # load secrets WITHOUT xtrace, so they never end up in the log
+      { set +x; } 2>/dev/null; set -a; . /etc/twitter/env; set +a; set -x
+      # one rake call = Rails boots once instead of twice (rake avoids the repo's Bundler-generated bin/rails warning)
+      sudo -u twitter -E bundle exec rake assets:precompile db:prepare
+
+      # 6) services
+      step "6) services"
+      systemctl daemon-reload
+      systemctl enable --now twitter
+
+      # 7) TLS: start with a self-signed cert so nginx can start at all,
+      step "7) TLS: start with a self-signed cert so nginx can start at all,"
+      #    then try a real Let's Encrypt cert (HTTP-01 through the host router)
+      install -d -m 0755 /var/www/letsencrypt
+      install -d -m 0750 /etc/nginx/ssl
+      openssl req -x509 -nodes -newkey rsa:2048 -days 30 -subj "/CN=__FQDN__" \
+        -keyout /etc/nginx/ssl/selfsigned.key -out /etc/nginx/ssl/selfsigned.crt
+      chmod 0600 /etc/nginx/ssl/selfsigned.key
+      ln -sf /etc/nginx/ssl/selfsigned.crt /etc/nginx/ssl/fullchain.pem
+      ln -sf /etc/nginx/ssl/selfsigned.key /etc/nginx/ssl/privkey.pem
+      rm -f /etc/nginx/sites-enabled/default
+      ln -sf /etc/nginx/sites-available/twitter /etc/nginx/sites-enabled/twitter
+      nginx -t && systemctl reload nginx
+
+      LE_FLAGS="__LE_FLAGS__"   # "--staging" while testing, "" = real cert, "skip" = self-signed only
+      if [ "$LE_FLAGS" != "skip" ] && certbot certonly --webroot -w /var/www/letsencrypt \
+           -d __FQDN__ --non-interactive --agree-tos --register-unsafely-without-email $LE_FLAGS; then
+        ln -sf /etc/letsencrypt/live/__FQDN__/fullchain.pem /etc/nginx/ssl/fullchain.pem
+        ln -sf /etc/letsencrypt/live/__FQDN__/privkey.pem   /etc/nginx/ssl/privkey.pem
+        # renewal (certbot.timer from the package) reloads nginx afterwards
+        install -d /etc/letsencrypt/renewal-hooks/deploy
+        printf '#!/bin/sh\nsystemctl reload nginx\n' > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+        chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+        echo "TLS: Let's Encrypt ${LE_FLAGS:-production}"
+      else
+        echo "TLS: self-signed fallback (no public DNS / port 80 not reachable / skip)"
+      fi
+      nginx -t && systemctl reload nginx
+
+      # 8) monitoring + logging
+      step "8) monitoring + logging"
+      systemctl restart systemd-journald
+      # postgres exporter: own DB role (peer auth as OS user "prometheus"), read-only monitoring rights
+      sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE ROLE prometheus LOGIN; GRANT pg_monitor TO prometheus;"
+      # Grafana, Loki, Alloy: Grafana's official apt repository
+      install -d -m 0755 /etc/apt/keyrings
+      curl -fsSL https://apt.grafana.com/gpg.key | gpg --dearmor -o /etc/apt/keyrings/grafana.gpg
+      echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main" > /etc/apt/sources.list.d/grafana.list
+      apt-get update -q
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -q grafana loki alloy
+      install -m 0644 /etc/sk44/loki.yml /etc/loki/config.yml
+      install -m 0644 /etc/sk44/config.alloy /etc/alloy/config.alloy
+      install -m 0644 /etc/sk44/grafana-datasources.yml /etc/grafana/provisioning/datasources/sk44.yml
+      install -m 0644 /etc/sk44/grafana-dashboards.yml /etc/grafana/provisioning/dashboards/sk44.yml
+      # Alloy must be allowed to read the journal and /var/log/nginx
+      ALLOY_USER=$(systemctl show -p User --value alloy); ALLOY_USER=${ALLOY_USER:-root}
+      [ "$ALLOY_USER" = root ] || usermod -aG adm,systemd-journal "$ALLOY_USER"
+      LOKI_USER=$(systemctl show -p User --value loki); LOKI_USER=${LOKI_USER:-root}
+      install -d -o "$LOKI_USER" -g "$(id -gn "$LOKI_USER")" /var/lib/loki
+      # Grafana on 127.0.0.1:3001 under /grafana/, no sign-up, no anonymous access
+      install -d /etc/systemd/system/grafana-server.service.d
+      printf '[Service]\nEnvironmentFile=/etc/sk44/grafana.env\n' > /etc/systemd/system/grafana-server.service.d/override.conf
+      { set +x; } 2>/dev/null
+      cat > /etc/sk44/grafana.env <<EOF
+      GF_SERVER_HTTP_ADDR=127.0.0.1
+      GF_SERVER_HTTP_PORT=3001
+      GF_SERVER_ROOT_URL=https://__FQDN__/grafana/
+      GF_SERVER_SERVE_FROM_SUB_PATH=true
+      GF_SECURITY_ADMIN_USER=admin
+      GF_SECURITY_ADMIN_PASSWORD=$MONPASS
+      GF_SECURITY_COOKIE_SECURE=true
+      GF_USERS_ALLOW_SIGN_UP=false
+      GF_AUTH_ANONYMOUS_ENABLED=false
+      GF_ANALYTICS_REPORTING_ENABLED=false
+      EOF
+      chmod 0600 /etc/sk44/grafana.env
+      set -x
+      # ready-made community dashboards: Node Exporter Full, PostgreSQL, Redis (a failed download is not fatal)
+      install -d -o grafana -g grafana /var/lib/grafana/dashboards
+      for d in 1860:node 9628:postgres 11835:redis; do
+        curl -fsSL "https://grafana.com/api/dashboards/${d%%:*}/revisions/latest/download" \
+          | sed 's/${DS_PROMETHEUS}/prometheus/g' > "/var/lib/grafana/dashboards/${d##*:}.json" || echo "WARN: dashboard ${d%%:*} not downloaded"
+      done
+      chown -R grafana:grafana /var/lib/grafana/dashboards
+      systemctl daemon-reload
+      MON="prometheus prometheus-node-exporter prometheus-postgres-exporter prometheus-redis-exporter prometheus-nginx-exporter grafana-server loki alloy fail2ban"
+      systemctl enable $MON
+      systemctl restart $MON
+
+      # 9) firewall: only SSH + HTTP(S)
+      step "9) firewall: only SSH + HTTP(S)"
+      ufw default deny incoming
+      ufw default allow outgoing
+      ufw allow OpenSSH
+      ufw allow 'Nginx Full'
+      ufw allow from 192.168.56.0/24 to any port 8443 proto tcp
+      ufw --force enable
+
+      # 10) smoke test: fails the deploy if anything is not working
+      step "10) smoke test: fails the deploy if anything is not working"
+      FAIL=0
+      check() { local n=$1; shift; if "$@" >/dev/null 2>&1; then echo "SMOKE OK   $n"; else echo "SMOKE FAIL $n"; FAIL=1; fi; }
+      retry() { local i; for i in $(seq 60); do "$@" && return 0; sleep 3; done; return 1; }
+      H=(curl -fsSk --resolve __FQDN__:443:127.0.0.1)
+      for svc in nginx postgresql redis-server twitter $MON; do check "service $svc" systemctl is-active --quiet "$svc"; done
+      check "HTTPS app /up"            retry "${H[@]}" https://__FQDN__/up
+      check "HTTP -> HTTPS redirect"   bash -c "curl -sI -H 'Host: __FQDN__' http://127.0.0.1/ | grep -qi '^location: https://'"
+      check "Grafana /grafana/api/health" retry "${H[@]}" https://__FQDN__/grafana/api/health
+      check "Prometheus needs a password" bash -c "[ \"\$(curl -sk -o /dev/null -w '%{http_code}' --resolve __FQDN__:443:127.0.0.1 https://__FQDN__/prometheus/)\" = 401 ]"
+      check "all Prometheus targets up" retry bash -c "curl -s http://127.0.0.1:9090/prometheus/api/v1/targets | jq -e '[.data.activeTargets[] | select(.health!=\"up\")] | length==0'"
+      check "firewall active"          bash -c "ufw status | grep -q 'Status: active'"
+      [ "$FAIL" -eq 0 ] || { echo "SMOKE TEST FAILED"; exit 1; }
+      echo "SETUP DONE"
+
+# --- runcmd runs in the final stage, after packages + deferred files
+runcmd:
+  - [bash, -c, "install -m 600 /dev/null /var/log/setup-app.log && /usr/local/sbin/setup-app.sh >> /var/log/setup-app.log 2>&1"]
+
+final_message: "cloud-init finished after $UPTIME s"

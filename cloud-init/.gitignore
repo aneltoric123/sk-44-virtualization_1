@@ -1,0 +1,8 @@
+# downloaded / generated on the host, never committed
+*.img
+*.vdi
+seed.iso
+SHA256SUMS
+# rendered from user-data.tmpl: contains the SSH public key and optional OAuth secrets
+user-data
+*.bak-*
