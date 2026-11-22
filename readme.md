@@ -270,5 +270,7 @@ sk-44-virtualization/
 ![screenshot](/photos/Screenshot%202026_6.png)
 ![screenshot](/photos/Screenshot%202026_7.png)
 
+VIDEO (Samo kliknete njega)!
+
 [![Video postopka](/photos/Screenshot%202026_1.png)](vids/Vagrant.mp4)
 
