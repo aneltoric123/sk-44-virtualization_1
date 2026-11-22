@@ -47,6 +47,7 @@ if [ "$TLS_MODE" = mkcert ]; then
   echo "Hosts entry (on the computer where your BROWSER runs):"
   if [ "$PUBLIC_HTTPS_PORT" = "443" ]; then
     echo "  $VM_IP  $DOMAIN"
+    echo "Optionally Put # before if you have 127.0.0.1 myapp.local in the hosts file(if it doesnt work)"
   else
     echo "  127.0.0.1  $DOMAIN   (and open a tunnel to port $PUBLIC_HTTPS_PORT)"
   fi

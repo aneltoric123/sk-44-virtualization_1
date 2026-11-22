@@ -270,4 +270,4 @@ sk-44-virtualization/
 ![screenshot](/photos/Screenshot%202026_6.png)
 ![screenshot](/photos/Screenshot%202026_7.png)
 
-**Video postopka:** [/video/]
+[![Video postopka](docs/01-vagrant-up.png)](video/Vagrant.mp4)
