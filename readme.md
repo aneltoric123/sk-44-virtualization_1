@@ -271,5 +271,4 @@ sk-44-virtualization/
 ![screenshot](/photos/Screenshot%202026_7.png)
 
 [![Video postopka](/photos/Screenshot%202026_1.png)](vids/Vagrant.mp4)
-/Users/aneltoric/Documents/Uni/DEVOPS/VMS/vids/Vagrant.mp4
 
